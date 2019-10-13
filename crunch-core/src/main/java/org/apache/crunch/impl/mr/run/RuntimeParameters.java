@@ -45,6 +45,14 @@ public final class RuntimeParameters {
 
   public static final String FILE_TARGET_MAX_THREADS = "crunch.file.target.max.threads";
 
+  public static final String MAX_POLL_INTERVAL = "crunch.max.poll.interval";
+
+  public static final String FILE_TARGET_USE_DISTCP = "crunch.file.target.use.distcp";
+
+  public static final String FILE_TARGET_MAX_DISTCP_TASKS = "crunch.file.target.max.distcp.tasks";
+
+  public static final String FILE_TARGET_MAX_DISTCP_TASK_BANDWIDTH_MB = "crunch.file.target.max.distcp.task.bandwidth.mb";
+
   // Not instantiated
   private RuntimeParameters() {
   }

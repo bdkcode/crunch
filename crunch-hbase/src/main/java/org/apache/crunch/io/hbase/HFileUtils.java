@@ -52,6 +52,7 @@ import org.apache.crunch.lib.sort.TotalOrderPartitioner;
 import org.apache.crunch.types.writable.Writables;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
@@ -59,12 +60,14 @@ import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValueUtil;
+import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.Tag;
-import org.apache.hadoop.hbase.client.HTable;
+import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.RegionLocator;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.io.TimeRange;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.io.BytesWritable;
@@ -117,7 +120,7 @@ public final class HFileUtils {
     }
 
     private int compareType(KeyValue l, KeyValue r) {
-      return (int) r.getType() - (int) l.getType();
+      return (int) r.getTypeByte() - (int) l.getTypeByte();
     }
 
   };
@@ -272,9 +275,9 @@ public final class HFileUtils {
       Cell leftKey = new KeyValue(left, loffset + 8, llength - 8);
       Cell rightKey = new KeyValue(right, roffset + 8, rlength - 8);
 
-      byte[] lRow = leftKey.getRow();
-      byte[] rRow = rightKey.getRow();
-      int rowCmp = Bytes.compareTo(lRow, rRow);
+      int rowCmp = Bytes.compareTo(
+          leftKey.getRowArray(), leftKey.getRowOffset(), leftKey.getRowLength(),
+          rightKey.getRowArray(), rightKey.getRowOffset(), rightKey.getRowLength());
       if (rowCmp != 0) {
         return rowCmp;
       } else {
@@ -298,8 +301,27 @@ public final class HFileUtils {
     }
   }
 
+  /**
+   * Scans HFiles.
+   *
+   * @param pipeline the pipeline
+   * @param path path to HFiles
+   * @return {@code Result}s
+   */
   public static PCollection<Result> scanHFiles(Pipeline pipeline, Path path) {
     return scanHFiles(pipeline, path, new Scan());
+  }
+
+  /**
+   * Scans HFiles with source filesystem.
+   *
+   * @param pipeline the pipeline
+   * @param path path to HFiles
+   * @param fs filesystem where HFiles are located
+   * @return {@code Result}s
+   */
+  public static PCollection<Result> scanHFiles(Pipeline pipeline, Path path, FileSystem fs) {
+    return scanHFiles(pipeline, path, new Scan(), fs);
   }
 
   /**
@@ -312,27 +334,74 @@ public final class HFileUtils {
    * @see #combineIntoRow(org.apache.crunch.PCollection, org.apache.hadoop.hbase.client.Scan)
    */
   public static PCollection<Result> scanHFiles(Pipeline pipeline, Path path, Scan scan) {
-      return scanHFiles(pipeline, ImmutableList.of(path), scan);
+    return scanHFiles(pipeline, ImmutableList.of(path), scan);
   }
 
+  /**
+   * Scans HFiles with filter conditions and source filesystem.
+   *
+   * @param pipeline the pipeline
+   * @param path path to HFiles
+   * @param scan filtering conditions
+   * @param fs filesystem where HFiles are located
+   * @return {@code Result}s
+   * @see #combineIntoRow(org.apache.crunch.PCollection, org.apache.hadoop.hbase.client.Scan)
+   */
+  public static PCollection<Result> scanHFiles(Pipeline pipeline, Path path, Scan scan, FileSystem fs) {
+    return scanHFiles(pipeline, ImmutableList.of(path), scan, fs);
+  }
+
+  /**
+   * Scans HFiles with filter conditions.
+   *
+   * @param pipeline the pipeline
+   * @param paths paths to HFiles
+   * @param scan filtering conditions
+   * @return {@code Result}s
+   * @see #combineIntoRow(org.apache.crunch.PCollection, org.apache.hadoop.hbase.client.Scan)
+   */
   public static PCollection<Result> scanHFiles(Pipeline pipeline, List<Path> paths, Scan scan) {
-      PCollection<KeyValue> in = pipeline.read(new HFileSource(paths, scan));
-      return combineIntoRow(in, scan);
+    return scanHFiles(pipeline, paths, scan, null);
   }
 
+  /**
+   * Scans HFiles with filter conditions and source filesystem.
+   *
+   * @param pipeline the pipeline
+   * @param paths paths to HFiles
+   * @param scan filtering conditions
+   * @param fs filesystem where HFiles are located
+   * @return {@code Result}s
+   * @see #combineIntoRow(org.apache.crunch.PCollection, org.apache.hadoop.hbase.client.Scan)
+   */
+  public static PCollection<Result> scanHFiles(Pipeline pipeline, List<Path> paths, Scan scan, FileSystem fs) {
+    PCollection<KeyValue> in = pipeline.read(new HFileSource(paths, scan).fileSystem(fs));
+    return combineIntoRow(in, scan);
+  }
+
+  /**
+   * Converts a bunch of {@link Cell}s into {@link Result}.
+   *
+   * All {@code Cell}s belong to the same row are combined. Deletes are dropped and only
+   * the latest version is kept.
+   *
+   * @param cells the input {@code Cell}s
+   * @return {@code Result}s
+   */
   public static <C extends Cell> PCollection<Result> combineIntoRow(PCollection<C> cells) {
     return combineIntoRow(cells, new Scan());
   }
 
   /**
-   * Converts a bunch of {@link KeyValue}s into {@link Result}.
+   * Converts a bunch of {@link Cell}s into {@link Result}.
    *
-   * All {@code KeyValue}s belong to the same row are combined. Users may provide some filter
-   * conditions (specified by {@code scan}). Deletes are dropped and only a specified number
-   * of versions are kept.
+   * All {@code Cell}s belong to the same row are combined. Users may provide some filter
+   * conditions (specified by {@code scan}). Deletes are dropped and only the number
+   * of versions specified by {@code scan.getMaxVersions()} are kept.
    *
-   * @param cells the input {@code KeyValue}s
-   * @param scan filter conditions, currently we support start row, stop row and family map
+   * @param cells the input {@code Cell}s
+   * @param scan filter conditions, currently we support start row, stop row, family map,
+   *             time range, and max versions
    * @return {@code Result}s
    */
   public static <C extends Cell> PCollection<Result> combineIntoRow(PCollection<C> cells, Scan scan) {
@@ -360,7 +429,7 @@ public final class HFileUtils {
             List<KeyValue> cells = Lists.newArrayList();
             for (Cell kv : input.second()) {
               try {
-                cells.add(KeyValue.cloneAndAddTags(kv, ImmutableList.<Tag>of())); // assuming the input fits into memory
+                cells.add(KeyValueUtil.copyToNewKeyValue(kv)); // assuming the input fits in memory
               } catch (Exception e) {
                 throw new RuntimeException(e);
               }
@@ -374,71 +443,185 @@ public final class HFileUtils {
         }, HBaseTypes.results());
   }
 
+  /**
+   * Writes out cells to HFiles for incremental load.
+   *
+   * @param cells the HBase cells to write
+   * @param connection HBase client connection
+   * @param tableName HBase table name
+   * @param outputPath HFile location
+   */
   public static <C extends Cell> void writeToHFilesForIncrementalLoad(
           PCollection<C> cells,
-          HTable table,
+          Connection connection,
+          TableName tableName,
           Path outputPath) throws IOException {
-    writeToHFilesForIncrementalLoad(cells, table, outputPath, false);
+    writeToHFilesForIncrementalLoad(cells, connection, tableName, outputPath, false);
   }
 
   /**
-   * Writes out HFiles from the provided <code>cells</code> and <code>table</code>. <code>limitToAffectedRegions</code>
-   * is used to indicate that the regions the <code>cells</code> will be loaded into should be identified prior to writing
-   * HFiles. Identifying the regions ahead of time will reduce the number of reducers needed when writing. This is
-   * beneficial if the data to be loaded only touches a small enough subset of the total regions in the table. If set to
-   * false, the number of reducers will equal the number of regions in the table.
+   * Writes out cells to HFiles for incremental load.
    *
+   * @param cells the HBase cells to write
+   * @param connection HBase client connection
+   * @param tableName HBase table name
+   * @param outputPath HFile location
+   * @param fs the filesystem where the HFiles will be written
+   */
+  public static <C extends Cell> void writeToHFilesForIncrementalLoad(
+      PCollection<C> cells,
+      Connection connection,
+      TableName tableName,
+      Path outputPath,
+      FileSystem fs) throws IOException {
+    writeToHFilesForIncrementalLoad(cells, connection, tableName, outputPath, false, fs);
+  }
+
+  /**
+   * Writes out cells to HFiles for incremental load.
+   *
+   * @param cells the HBase cells to write
+   * @param connection HBase client connection
+   * @param tableName HBase table name
+   * @param outputPath HFile location
+   * @param limitToAffectedRegions used to indicate that the regions the {@code puts} will be loaded into should be
+   *     identified prior to writing HFiles. Identifying the regions ahead of time will reduce the number of reducers needed
+   *     when writing. This is beneficial if the data to be loaded only touches a small enough subset of the total regions in
+   *     the table. If set to false, the number of reducers will equal the number of regions in the table.
    * @see <a href='https://issues.apache.org/jira/browse/CRUNCH-588'>CRUNCH-588</a>
    */
   public static <C extends Cell> void writeToHFilesForIncrementalLoad(
       PCollection<C> cells,
-      HTable table,
+      Connection connection,
+      TableName tableName,
       Path outputPath,
       boolean limitToAffectedRegions) throws IOException {
+    writeToHFilesForIncrementalLoad(cells, connection, tableName, outputPath, limitToAffectedRegions, null);
+  }
+
+  /**
+   * Writes out cells to HFiles for incremental load.
+   *
+   * @param cells the HBase cells to write
+   * @param connection HBase client connection
+   * @param tableName HBase table name
+   * @param outputPath HFile location
+   * @param limitToAffectedRegions used to indicate that the regions the {@code puts} will be loaded into should be
+   *     identified prior to writing HFiles. Identifying the regions ahead of time will reduce the number of reducers needed
+   *     when writing. This is beneficial if the data to be loaded only touches a small enough subset of the total regions in
+   *     the table. If set to false, the number of reducers will equal the number of regions in the table.
+   * @param fs the filesystem where the HFiles will be written
+   * @see <a href='https://issues.apache.org/jira/browse/CRUNCH-588'>CRUNCH-588</a>
+   */
+  public static <C extends Cell> void writeToHFilesForIncrementalLoad(
+      PCollection<C> cells,
+      Connection connection,
+      TableName tableName,
+      Path outputPath,
+      boolean limitToAffectedRegions,
+      FileSystem fs) throws IOException {
+    Table table = connection.getTable(tableName);
+    RegionLocator regionLocator = connection.getRegionLocator(tableName);
     HColumnDescriptor[] families = table.getTableDescriptor().getColumnFamilies();
     if (families.length == 0) {
       LOG.warn("{} has no column families", table);
       return;
     }
-    PCollection<C> partitioned = sortAndPartition(cells, table, limitToAffectedRegions);
+    PCollection<C> partitioned = sortAndPartition(cells, regionLocator, limitToAffectedRegions);
     RegionLocationTable regionLocationTable = RegionLocationTable.create(
         table.getName().getNameAsString(),
-        ((RegionLocator) table).getAllRegionLocations());
+        regionLocator.getAllRegionLocations());
     Path regionLocationFilePath = new Path(((DistributedPipeline) cells.getPipeline()).createTempPath(),
-        "regionLocations" + table.getName().getNameAsString());
+        "regionLocations_" + table.getName().getNameAsString().replace(":", "_"));
      writeRegionLocationTable(cells.getPipeline().getConfiguration(), regionLocationFilePath, regionLocationTable);
 
     for (HColumnDescriptor f : families) {
       byte[] family = f.getName();
-      HFileTarget hfileTarget = new HFileTarget(new Path(outputPath, Bytes.toString(family)), f);
-      hfileTarget.outputConf(RegionLocationTable.REGION_LOCATION_TABLE_PATH, regionLocationFilePath.toString());
       partitioned
           .filter(new FilterByFamilyFn<C>(family))
-          .write(hfileTarget);
+          .write(new HFileTarget(new Path(outputPath, Bytes.toString(family)), f)
+              .outputConf(RegionLocationTable.REGION_LOCATION_TABLE_PATH, regionLocationFilePath.toString())
+              .fileSystem(fs));
     }
   }
 
+  /**
+   * Writes out puts to HFiles for incremental load.
+   *
+   * @param puts the HBase puts to write
+   * @param connection HBase client connection
+   * @param tableName HBase table name
+   * @param outputPath HFile location
+   */
   public static void writePutsToHFilesForIncrementalLoad(
           PCollection<Put> puts,
-          HTable table,
+          Connection connection,
+          TableName tableName,
           Path outputPath) throws IOException {
-    writePutsToHFilesForIncrementalLoad(puts, table, outputPath, false);
+    writePutsToHFilesForIncrementalLoad(puts, connection, tableName, outputPath, false);
   }
 
   /**
-   * Writes out HFiles from the provided <code>puts</code> and <code>table</code>. <code>limitToAffectedRegions</code>
-   * is used to indicate that the regions the <code>puts</code> will be loaded into should be identified prior to writing
-   * HFiles. Identifying the regions ahead of time will reduce the number of reducers needed when writing. This is
-   * beneficial if the data to be loaded only touches a small enough subset of the total regions in the table. If set to
-   * false, the number of reducers will equal the number of regions in the table.
+   * Writes out puts to HFiles for incremental load.
    *
+   * @param puts the HBase puts to write
+   * @param connection HBase client connection
+   * @param tableName HBase table name
+   * @param outputPath HFile location
+   * @param fs the filesystem where the HFiles will be written
+   */
+  public static void writePutsToHFilesForIncrementalLoad(
+      PCollection<Put> puts,
+      Connection connection,
+      TableName tableName,
+      Path outputPath,
+      FileSystem fs) throws IOException {
+    writePutsToHFilesForIncrementalLoad(puts, connection, tableName, outputPath, false, fs);
+  }
+
+  /**
+   * Writes out puts to HFiles for incremental load.
+   *
+   * @param puts the HBase puts to write
+   * @param connection HBase client connection
+   * @param tableName HBase table name
+   * @param outputPath HFile location
+   * @param limitToAffectedRegions used to indicate that the regions the {@code puts} will be loaded into should be
+   *     identified prior to writing HFiles. Identifying the regions ahead of time will reduce the number of reducers needed
+   *     when writing. This is beneficial if the data to be loaded only touches a small enough subset of the total regions in
+   *     the table. If set to false, the number of reducers will equal the number of regions in the table.
    * @see <a href='https://issues.apache.org/jira/browse/CRUNCH-588'>CRUNCH-588</a>
    */
   public static void writePutsToHFilesForIncrementalLoad(
       PCollection<Put> puts,
-      HTable table,
+      Connection connection,
+      TableName tableName,
       Path outputPath,
       boolean limitToAffectedRegions) throws IOException {
+    writePutsToHFilesForIncrementalLoad(puts, connection, tableName, outputPath, limitToAffectedRegions, null);
+  }
+
+  /**
+   * Writes out puts to HFiles for incremental load.
+   *
+   * @param puts the HBase puts to write
+   * @param connection HBase client connection
+   * @param tableName HBase table name
+   * @param outputPath HFile location
+   * @param limitToAffectedRegions used to indicate that the regions the {@code puts} will be loaded into should be
+   *     identified prior to writing HFiles. Identifying the regions ahead of time will reduce the number of reducers needed
+   *     when writing. This is beneficial if the data to be loaded only touches a small enough subset of the total regions in
+   *     the table. If set to false, the number of reducers will equal the number of regions in the table.
+   * @param fs the filesystem where the HFiles will be written
+   * @see <a href='https://issues.apache.org/jira/browse/CRUNCH-588'>CRUNCH-588</a>
+   */
+  public static void writePutsToHFilesForIncrementalLoad(
+      PCollection<Put> puts,
+      Connection connection,
+      TableName tableName,
+      Path outputPath,
+      boolean limitToAffectedRegions,
+      FileSystem fs) throws IOException {
     PCollection<Cell> cells = puts.parallelDo("ConvertPutToCells", new DoFn<Put, Cell>() {
       @Override
       public void process(Put input, Emitter<Cell> emitter) {
@@ -447,21 +630,21 @@ public final class HFileUtils {
         }
       }
     }, HBaseTypes.cells());
-    writeToHFilesForIncrementalLoad(cells, table, outputPath, limitToAffectedRegions);
+    writeToHFilesForIncrementalLoad(cells, connection, tableName, outputPath, limitToAffectedRegions, fs);
   }
 
-  public static <C extends Cell> PCollection<C> sortAndPartition(PCollection<C> cells, HTable table) throws IOException {
-    return sortAndPartition(cells, table, false);
+  public static <C extends Cell> PCollection<C> sortAndPartition(PCollection<C> cells, RegionLocator regionLocator) throws IOException {
+    return sortAndPartition(cells, regionLocator, false);
   }
 
   /**
-   * Sorts and partitions the provided <code>cells</code> for the given <code>table</code> to ensure all elements that belong
+   * Sorts and partitions the provided <code>cells</code> for the given <code>regionLocator</code> to ensure all elements that belong
    * in the same region end up in the same reducer. The flag <code>limitToAffectedRegions</code>, when set to true, will identify
    * the regions the data in <code>cells</code> belongs to and will set the number of reducers equal to the number of identified
    * affected regions. If set to false, then all regions will be used, and the number of reducers will be set to the number
    * of regions in the table.
    */
-  public static <C extends Cell> PCollection<C> sortAndPartition(PCollection<C> cells, HTable table, boolean limitToAffectedRegions) throws IOException {
+  public static <C extends Cell> PCollection<C> sortAndPartition(PCollection<C> cells, RegionLocator regionLocator, boolean limitToAffectedRegions) throws IOException {
     Configuration conf = cells.getPipeline().getConfiguration();
     PTable<C, Void> t = cells.parallelDo(
         "Pre-partition",
@@ -474,9 +657,9 @@ public final class HFileUtils {
 
     List<KeyValue> splitPoints;
     if(limitToAffectedRegions) {
-      splitPoints = getSplitPoints(table, t);
+      splitPoints = getSplitPoints(regionLocator, t);
     } else {
-      splitPoints = getSplitPoints(table);
+      splitPoints = getSplitPoints(regionLocator);
     }
     Path partitionFile = new Path(((DistributedPipeline) cells.getPipeline()).createTempPath(), "partition");
     writePartitionInfo(conf, partitionFile, splitPoints);
@@ -489,10 +672,10 @@ public final class HFileUtils {
     return t.groupByKey(options).ungroup().keys();
   }
 
-  private static List<KeyValue> getSplitPoints(HTable table) throws IOException {
-    List<byte[]> startKeys = ImmutableList.copyOf(table.getStartKeys());
+  private static List<KeyValue> getSplitPoints(RegionLocator regionLocator) throws IOException {
+    List<byte[]> startKeys = ImmutableList.copyOf(regionLocator.getStartKeys());
     if (startKeys.isEmpty()) {
-      throw new AssertionError(table + " has no regions!");
+      throw new AssertionError(regionLocator.getName().getNameAsString() + " has no regions!");
     }
     List<KeyValue> splitPoints = Lists.newArrayList();
     for (byte[] startKey : startKeys.subList(1, startKeys.size())) {
@@ -503,12 +686,12 @@ public final class HFileUtils {
     return splitPoints;
   }
 
-  private static <C> List<KeyValue> getSplitPoints(HTable table, PTable<C, Void> affectedRows) throws IOException {
+  private static <C> List<KeyValue> getSplitPoints(RegionLocator regionLocator, PTable<C, Void> affectedRows) throws IOException {
     List<byte[]> startKeys;
     try {
-      startKeys = Lists.newArrayList(table.getStartKeys());
+      startKeys = Lists.newArrayList(regionLocator.getStartKeys());
       if (startKeys.isEmpty()) {
-        throw new AssertionError(table + " has no regions!");
+        throw new AssertionError(regionLocator.getName().getNameAsString() + " has no regions!");
       }
     } catch (IOException e) {
       throw new CrunchRuntimeException(e);
@@ -604,8 +787,8 @@ public final class HFileUtils {
     if (kvs.isEmpty()) {
       return null;
     }
-    if (kvs.size() == 1 && kvs.get(0).getType() == KeyValue.Type.Put.getCode()) {
-      return new Result(kvs);
+    if (kvs.size() == 1 && kvs.get(0).getTypeByte() == KeyValue.Type.Put.getCode()) {
+      return Result.create(Collections.<Cell>singletonList(kvs.get(0)));
     }
 
     kvs = maybeDeleteFamily(kvs);
@@ -613,7 +796,7 @@ public final class HFileUtils {
     // In-place sort KeyValues by family, qualifier and then timestamp reversely (whenever ties, deletes appear first).
     Collections.sort(kvs, KEY_VALUE_COMPARATOR);
 
-    List<KeyValue> results = Lists.newArrayListWithCapacity(kvs.size());
+    List<Cell> results = Lists.newArrayListWithCapacity(kvs.size());
     for (int i = 0, j; i < kvs.size(); i = j) {
       j = i + 1;
       while (j < kvs.size() && hasSameFamilyAndQualifier(kvs.get(i), kvs.get(j))) {
@@ -624,7 +807,7 @@ public final class HFileUtils {
     if (results.isEmpty()) {
       return null;
     }
-    return new Result(results);
+    return Result.create(results);
   }
 
   /**
@@ -634,7 +817,7 @@ public final class HFileUtils {
   private static List<KeyValue> maybeDeleteFamily(List<KeyValue> kvs) {
     long deleteFamilyCut = -1;
     for (KeyValue kv : kvs) {
-      if (kv.getType() == KeyValue.Type.DeleteFamily.getCode()) {
+      if (kv.getTypeByte() == KeyValue.Type.DeleteFamily.getCode()) {
         deleteFamilyCut = Math.max(deleteFamilyCut, kv.getTimestamp());
       }
     }
@@ -643,7 +826,7 @@ public final class HFileUtils {
     }
     List<KeyValue> results = Lists.newArrayList();
     for (KeyValue kv : kvs) {
-      if (kv.getType() == KeyValue.Type.DeleteFamily.getCode()) {
+      if (kv.getTypeByte() == KeyValue.Type.DeleteFamily.getCode()) {
         continue;
       }
       if (kv.getTimestamp() <= deleteFamilyCut) {
@@ -675,7 +858,7 @@ public final class HFileUtils {
     if (kvs.isEmpty()) {
       return kvs;
     }
-    if (kvs.get(0).getType() == KeyValue.Type.Put.getCode()) {
+    if (kvs.get(0).getTypeByte() == KeyValue.Type.Put.getCode()) {
       return kvs; // shortcut for the common case
     }
 
@@ -685,16 +868,16 @@ public final class HFileUtils {
       if (results.size() >= versions) {
         break;
       }
-      if (kv.getType() == KeyValue.Type.DeleteColumn.getCode()) {
+      if (kv.getTypeByte() == KeyValue.Type.DeleteColumn.getCode()) {
         break;
-      } else if (kv.getType() == KeyValue.Type.Put.getCode()) {
+      } else if (kv.getTypeByte() == KeyValue.Type.Put.getCode()) {
         if (kv.getTimestamp() != previousDeleteTimestamp) {
           results.add(kv);
         }
-      } else if (kv.getType() == KeyValue.Type.Delete.getCode()) {
+      } else if (kv.getTypeByte() == KeyValue.Type.Delete.getCode()) {
         previousDeleteTimestamp = kv.getTimestamp();
       } else {
-        throw new AssertionError("Unexpected KeyValue type: " + kv.getType());
+        throw new AssertionError("Unexpected KeyValue type: " + kv.getTypeByte());
       }
     }
     return results;

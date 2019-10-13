@@ -19,6 +19,7 @@ package org.apache.crunch.io.hbase;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Objects;
 
 import com.google.common.collect.Maps;
 import org.apache.commons.lang.builder.HashCodeBuilder;
@@ -32,6 +33,7 @@ import org.apache.crunch.io.OutputHandler;
 import org.apache.crunch.types.Converter;
 import org.apache.crunch.types.PType;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.TableName;
@@ -74,13 +76,13 @@ public class HBaseTarget implements MapReduceTarget {
     if (!other.getClass().equals(getClass()))
       return false;
     HBaseTarget o = (HBaseTarget) other;
-    return table.equals(o.table);
+    return Objects.equals(table, o.table) && Objects.equals(extraConf, o.extraConf);
   }
 
   @Override
   public int hashCode() {
     HashCodeBuilder hcb = new HashCodeBuilder();
-    return hcb.append(table).toHashCode();
+    return hcb.append(table).append(extraConf).toHashCode();
   }
 
   @Override
@@ -100,7 +102,7 @@ public class HBaseTarget implements MapReduceTarget {
   @Override
   public void configureForMapReduce(Job job, PType<?> ptype, Path outputPath, String name) {
     final Configuration conf = job.getConfiguration();
-    HBaseConfiguration.addHbaseResources(conf);
+    HBaseConfiguration.merge(conf, HBaseConfiguration.create(conf));
     conf.setStrings("io.serializations", conf.get("io.serializations"),
         MutationSerialization.class.getName());
     Class<?> typeClass = ptype.getTypeClass(); // Either Put or Delete
@@ -143,6 +145,18 @@ public class HBaseTarget implements MapReduceTarget {
   public Target outputConf(String key, String value) {
     extraConf.put(key, value);
     return this;
+  }
+
+  @Override
+  public Target fileSystem(FileSystem fileSystem) {
+    // not currently supported/applicable for HBase
+    return this;
+  }
+
+  @Override
+  public FileSystem getFileSystem() {
+    // not currently supported/applicable for HBase
+    return null;
   }
 
   @Override

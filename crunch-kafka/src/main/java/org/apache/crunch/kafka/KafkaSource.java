@@ -33,6 +33,7 @@ import org.apache.crunch.types.PTableType;
 import org.apache.crunch.types.PType;
 import org.apache.crunch.types.writable.Writables;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.mapreduce.Job;
@@ -58,7 +59,10 @@ import java.util.Properties;
  * The values retrieved from Kafka are returned as raw bytes inside of a {@link BytesWritable}.  If callers
  * need specific parsing logic based on the topic then consumers are encouraged to use multiple Kafka Sources
  * for each topic and use special {@link DoFn} to parse the payload.
+ *
+ * @deprecated Use {@link org.apache.crunch.kafka.record.KafkaSource} instead
  */
+@Deprecated
 public class KafkaSource
     implements TableSource<BytesWritable, BytesWritable>, ReadableSource<Pair<BytesWritable, BytesWritable>> {
 
@@ -108,6 +112,18 @@ public class KafkaSource
   public Source<Pair<BytesWritable, BytesWritable>> inputConf(String key, String value) {
     inputBundle.set(key, value);
     return this;
+  }
+
+  @Override
+  public Source<Pair<BytesWritable, BytesWritable>> fileSystem(FileSystem fileSystem) {
+    // not currently applicable/supported for Kafka
+    return this;
+  }
+
+  @Override
+  public FileSystem getFileSystem() {
+    // not currently applicable/supported for Kafka
+    return null;
   }
 
   @Override

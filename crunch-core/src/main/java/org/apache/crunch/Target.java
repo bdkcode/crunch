@@ -21,6 +21,7 @@ import org.apache.crunch.io.OutputHandler;
 import org.apache.crunch.types.Converter;
 import org.apache.crunch.types.PType;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
 
 /**
  * A {@code Target} represents the output destination of a Crunch {@code PCollection}
@@ -68,11 +69,31 @@ public interface Target {
   Target outputConf(String key, String value);
 
   /**
+   * Adds the {@code Configuration} of the given filesystem such that the target can write to it when the {@code
+   * Pipeline} itself does not have that configuration.
+   * </p>
+   * Changing the filesystem after it is set is not supported and will result in {@link
+   * IllegalStateException}
+   *
+   * @param fileSystem the filesystem
+   * @return this Target
+   * @throws IllegalStateException if the filesystem has already been set
+   * @throws IllegalArgumentException if the target is pointing to a fully qualified Path in a different FileSystem
+   */
+  Target fileSystem(FileSystem fileSystem);
+
+  /**
+   * Returns the {@code FileSystem} for this target or null if no explicit filesystem {@link #fileSystem(FileSystem)
+   * has been set}.
+   */
+  FileSystem getFileSystem();
+
+  /**
    * Apply the given {@code WriteMode} to this {@code Target} instance.
    * 
    * @param writeMode The strategy for handling existing outputs
    * @param lastModifiedAt the time of the most recent modification to one of the source inputs for handling based
-   *                       on the provided {@code writeMode}.
+   *                       on the provided {@code writeMode}, or -1 if not relevant for the provided {@code writeMode}
    * @param conf The ever-useful {@code Configuration} instance
    * @return true if the target did exist
    */

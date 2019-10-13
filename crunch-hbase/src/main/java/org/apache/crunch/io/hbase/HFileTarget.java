@@ -17,8 +17,6 @@
  */
 package org.apache.crunch.io.hbase;
 
-import com.google.common.base.Preconditions;
-import org.apache.commons.codec.binary.Hex;
 import org.apache.crunch.io.SequentialFileNamingScheme;
 import org.apache.crunch.io.impl.FileTargetImpl;
 import org.apache.crunch.types.Converter;
@@ -31,32 +29,34 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
 import org.apache.hadoop.hbase.mapreduce.KeyValueSerialization;
-import org.apache.hadoop.io.WritableUtils;
 import org.apache.hadoop.mapreduce.Job;
 
 public class HFileTarget extends FileTargetImpl {
-
-  private static final HColumnDescriptor DEFAULT_COLUMN_DESCRIPTOR = new HColumnDescriptor();
 
   public HFileTarget(String path) {
     this(new Path(path));
   }
 
   public HFileTarget(Path path) {
-    this(path, DEFAULT_COLUMN_DESCRIPTOR);
+    this(path, null);
   }
 
   public HFileTarget(Path path, HColumnDescriptor hcol) {
     super(path, HFileOutputFormatForCrunch.class, SequentialFileNamingScheme.getInstance());
-    Preconditions.checkNotNull(hcol);
-    outputConf(HFileOutputFormatForCrunch.HCOLUMN_DESCRIPTOR_KEY,
-        Hex.encodeHexString(WritableUtils.toByteArray(hcol)));
+    if (hcol != null) {
+      outputConf(HFileOutputFormatForCrunch.HCOLUMN_DESCRIPTOR_COMPRESSION_TYPE_KEY,
+          hcol.getCompressionType().getName());
+      outputConf(HFileOutputFormatForCrunch.HCOLUMN_DESCRIPTOR_DATA_BLOCK_ENCODING_KEY,
+          hcol.getDataBlockEncoding().name());
+      outputConf(HFileOutputFormatForCrunch.HCOLUMN_DESCRIPTOR_BLOOM_FILTER_TYPE_KEY,
+          hcol.getBloomFilterType().name());
+    }
   }
 
   @Override
   public void configureForMapReduce(Job job, PType<?> ptype, Path outputPath, String name) {
     Configuration conf = job.getConfiguration();
-    HBaseConfiguration.addHbaseResources(conf);
+    HBaseConfiguration.merge(conf, HBaseConfiguration.create(conf));
     conf.setStrings("io.serializations", conf.get("io.serializations"),
         KeyValueSerialization.class.getName());
     super.configureForMapReduce(job, ptype, outputPath, name);

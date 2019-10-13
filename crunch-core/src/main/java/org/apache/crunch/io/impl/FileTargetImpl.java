@@ -18,8 +18,12 @@
 package org.apache.crunch.io.impl;
 
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -29,7 +33,6 @@ import java.util.regex.Pattern;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
-import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListeningExecutorService;
@@ -48,12 +51,17 @@ import org.apache.crunch.io.PathTarget;
 import org.apache.crunch.io.SourceTargetHelper;
 import org.apache.crunch.types.Converter;
 import org.apache.crunch.types.PType;
+import org.apache.crunch.util.CrunchRenameCopyListing;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.tools.CopyListing;
+import org.apache.hadoop.tools.DistCp;
+import org.apache.hadoop.tools.DistCpConstants;
+import org.apache.hadoop.tools.DistCpOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,7 +69,7 @@ public class FileTargetImpl implements PathTarget {
 
   private static final Logger LOG = LoggerFactory.getLogger(FileTargetImpl.class);
   
-  protected final Path path;
+  protected Path path;
   private final FormatBundle<? extends FileOutputFormat> formatBundle;
   private final FileNamingScheme fileNamingScheme;
 
@@ -86,6 +94,25 @@ public class FileTargetImpl implements PathTarget {
   public Target outputConf(String key, String value) {
     formatBundle.set(key, value);
     return this;
+  }
+
+  @Override
+  public Target fileSystem(FileSystem fileSystem) {
+    if (formatBundle.getFileSystem() != null) {
+      throw new IllegalStateException("Filesystem already set. Change is not supported.");
+    }
+
+    if (fileSystem != null) {
+      path = fileSystem.makeQualified(path);
+
+      formatBundle.setFileSystem(fileSystem);
+    }
+    return this;
+  }
+
+  @Override
+  public FileSystem getFileSystem() {
+    return formatBundle.getFileSystem();
   }
 
   @Override
@@ -162,26 +189,55 @@ public class FileTargetImpl implements PathTarget {
   @Override
   public void handleOutputs(Configuration conf, Path workingPath, int index) throws IOException {
     FileSystem srcFs = workingPath.getFileSystem(conf);
-    Path src = getSourcePattern(workingPath, index);
-    Path[] srcs = FileUtil.stat2Paths(srcFs.globStatus(src), src);
-    FileSystem dstFs = path.getFileSystem(conf);
+    Configuration dstFsConf = getEffectiveBundleConfig(conf);
+    FileSystem dstFs = path.getFileSystem(dstFsConf);
     if (!dstFs.exists(path)) {
       dstFs.mkdirs(path);
     }
+    Path srcPattern = getSourcePattern(workingPath, index);
     boolean sameFs = isCompatible(srcFs, path);
+    boolean useDistributedCopy = conf.getBoolean(RuntimeParameters.FILE_TARGET_USE_DISTCP, true);
+    int maxDistributedCopyTasks = conf.getInt(RuntimeParameters.FILE_TARGET_MAX_DISTCP_TASKS, 100);
+    int maxDistributedCopyTaskBandwidthMB = conf.getInt(RuntimeParameters.FILE_TARGET_MAX_DISTCP_TASK_BANDWIDTH_MB,
+        DistCpConstants.DEFAULT_BANDWIDTH_MB);
+    int maxThreads = conf.getInt(RuntimeParameters.FILE_TARGET_MAX_THREADS, 1);
+
+    if (!sameFs) {
+      if (useDistributedCopy) {
+        LOG.info("Source and destination are in different file systems, performing distributed copy from {} to {}", srcPattern,
+            path);
+        handleOutputsDistributedCopy(conf, srcPattern, srcFs, dstFs, maxDistributedCopyTasks,
+            maxDistributedCopyTaskBandwidthMB);
+      } else {
+        LOG.info("Source and destination are in different file systems, performing asynch copies from {} to {}", srcPattern, path);
+        handleOutputsAsynchronously(conf, srcPattern, srcFs, dstFs, sameFs, maxThreads);
+      }
+    } else {
+      LOG.info("Source and destination are in the same file system, performing asynch renames from {} to {}", srcPattern, path);
+      handleOutputsAsynchronously(conf, srcPattern, srcFs, dstFs, sameFs, maxThreads);
+    }
+  }
+
+  private void handleOutputsAsynchronously(Configuration conf, Path srcPattern, FileSystem srcFs, FileSystem dstFs,
+          boolean sameFs, int maxThreads) throws IOException {
+    Configuration dstFsConf = getEffectiveBundleConfig(conf);
+    Path[] srcs = FileUtil.stat2Paths(srcFs.globStatus(srcPattern), srcPattern);
     List<ListenableFuture<Boolean>> renameFutures = Lists.newArrayList();
     ListeningExecutorService executorService =
         MoreExecutors.listeningDecorator(
             Executors.newFixedThreadPool(
-                conf.getInt(RuntimeParameters.FILE_TARGET_MAX_THREADS, 1)));
+                maxThreads));
     for (Path s : srcs) {
-      Path d = getDestFile(conf, s, path, s.getName().contains("-m-"));
+      Path d = getDestFile(dstFsConf, s, path, s.getName().contains("-m-"));
       renameFutures.add(
           executorService.submit(
               new WorkingPathFileMover(conf, s, d, srcFs, dstFs, sameFs)));
     }
-    LOG.debug("Renaming " + renameFutures.size() + " files.");
-
+    if (sameFs) {
+      LOG.info("Renaming {} files using at most {} threads.", renameFutures.size(), maxThreads);
+    } else {
+      LOG.info("Copying {} files using at most {} threads.", renameFutures.size(), maxThreads);
+    }
     ListenableFuture<List<Boolean>> future =
         Futures.successfulAsList(renameFutures);
     List<Boolean> renameResults = null;
@@ -193,9 +249,35 @@ public class FileTargetImpl implements PathTarget {
       executorService.shutdownNow();
     }
     if (renameResults != null && !renameResults.contains(false)) {
+      if (sameFs) {
+        LOG.info("Renamed {} files.", renameFutures.size());
+      } else {
+        LOG.info("Copied {} files.", renameFutures.size());
+      }
       dstFs.create(getSuccessIndicator(), true).close();
-      LOG.debug("Renamed " + renameFutures.size() + " files.");
+      LOG.info("Created success indicator file");
     }
+  }
+
+  private void handleOutputsDistributedCopy(Configuration conf, Path srcPattern, FileSystem srcFs, FileSystem dstFs,
+          int maxTasks, int maxBandwidthMB) throws IOException {
+    Configuration dstFsConf = getEffectiveBundleConfig(conf);
+    Path[] srcs = FileUtil.stat2Paths(srcFs.globStatus(srcPattern), srcPattern);
+    if (srcs.length > 0) {
+      try {
+        DistCp distCp = createDistCp(srcs, maxTasks, maxBandwidthMB, dstFsConf);
+        if (!distCp.execute().isSuccessful()) {
+          throw new CrunchRuntimeException("Distributed copy failed from " + srcPattern + " to " + path);
+        }
+        LOG.info("Distributed copy completed for {} files", srcs.length);
+      } catch (Exception e) {
+        throw new CrunchRuntimeException("Distributed copy failed from " + srcPattern + " to " + path, e);
+      }
+    } else {
+      LOG.info("No files found to distributed copy at {}", srcPattern);
+    }
+    dstFs.create(getSuccessIndicator(), true).close();
+    LOG.info("Created success indicator file");
   }
   
   protected Path getSuccessIndicator() {
@@ -238,7 +320,38 @@ public class FileTargetImpl implements PathTarget {
     }
     return new Path(dir, outputFilename);
   }
-  
+
+  protected DistCp createDistCp(Path[] srcs, int maxTasks, int maxBandwidthMB, Configuration conf) throws Exception {
+    LOG.info("Distributed copying {} files using at most {} tasks and bandwidth limit of {} MB/s per task",
+        new Object[]{srcs.length, maxTasks, maxBandwidthMB});
+
+    Configuration distCpConf = new Configuration(conf);
+
+    // Remove unnecessary and problematic properties from the DistCp configuration. This is necessary since
+    // files referenced by these properties may have already been deleted when the DistCp is being started.
+    distCpConf.unset("mapreduce.job.cache.files");
+    distCpConf.unset("mapreduce.job.classpath.files");
+    distCpConf.unset("tmpjars");
+
+    // Setup renaming for part files
+    List<String> renames = Lists.newArrayList();
+    for (Path s : srcs) {
+      Path d = getDestFile(conf, s, path, s.getName().contains("-m-"));
+      renames.add(s.getName() + ":" + d.getName());
+    }
+    distCpConf.setStrings(CrunchRenameCopyListing.DISTCP_PATH_RENAMES, renames.toArray(new String[renames.size()]));
+    distCpConf.setClass(DistCpConstants.CONF_LABEL_COPY_LISTING_CLASS, CrunchRenameCopyListing.class, CopyListing.class);
+
+    // Once https://issues.apache.org/jira/browse/HADOOP-15281 is available, we can use the direct write
+    // distcp optimization if the target path is in S3
+    DistCpOptions options = new DistCpOptions(Arrays.asList(srcs), path);
+    options.setMaxMaps(maxTasks);
+    options.setMapBandwidth(maxBandwidthMB);
+    options.setBlocking(true);
+
+    return new DistCp(distCpConf, options);
+  }
+
   /**
    * Extract the partition number from a raw reducer output filename.
    *
@@ -265,12 +378,12 @@ public class FileTargetImpl implements PathTarget {
       return false;
     }
     FileTargetImpl o = (FileTargetImpl) other;
-    return path.equals(o.path);
+    return Objects.equals(path, o.path) && Objects.equals(formatBundle, o.formatBundle);
   }
 
   @Override
   public int hashCode() {
-    return new HashCodeBuilder().append(path).toHashCode();
+    return new HashCodeBuilder().append(path).append(formatBundle).toHashCode();
   }
 
   @Override
@@ -289,11 +402,16 @@ public class FileTargetImpl implements PathTarget {
     return null;
   }
 
+  private Configuration getEffectiveBundleConfig(Configuration configuration) {
+    // overlay the bundle config on top of a copy of the supplied config
+    return formatBundle.configure(new Configuration(configuration));
+  }
+
   @Override
   public boolean handleExisting(WriteMode strategy, long lastModForSource, Configuration conf) {
     FileSystem fs = null;
     try {
-      fs = path.getFileSystem(conf);
+      fs = path.getFileSystem(getEffectiveBundleConfig(conf));
     } catch (IOException e) {
       LOG.error("Could not retrieve FileSystem object to check for existing path", e);
       throw new CrunchRuntimeException(e);
@@ -306,7 +424,11 @@ public class FileTargetImpl implements PathTarget {
       exists = fs.exists(path);
       if (exists) {
         successful = fs.exists(getSuccessIndicator());
-        lastModForTarget = SourceTargetHelper.getLastModifiedAt(fs, path);
+        // Last modified time is only relevant when the path exists and the
+        // write mode is checkpoint
+        if (successful && strategy == WriteMode.CHECKPOINT) {
+          lastModForTarget = SourceTargetHelper.getLastModifiedAt(fs, path);
+        }
       }
     } catch (IOException e) {
       LOG.error("Exception checking existence of path: {}", path, e);

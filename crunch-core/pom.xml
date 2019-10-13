@@ -22,7 +22,7 @@ under the License.
   <parent>
     <groupId>org.apache.crunch</groupId>
     <artifactId>crunch-parent</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>1.1.0-SNAPSHOT</version>
   </parent>
 
   <artifactId>crunch-core</artifactId>
@@ -64,6 +64,12 @@ under the License.
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-client</artifactId>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-distcp</artifactId>
       <scope>provided</scope>
     </dependency>
 
@@ -119,6 +125,12 @@ under the License.
     <dependency>
       <groupId>org.apache.crunch</groupId>
       <artifactId>crunch-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-minicluster</artifactId>
       <scope>test</scope>
     </dependency>
 

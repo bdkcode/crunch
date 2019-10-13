@@ -17,7 +17,6 @@
  */
 package org.apache.crunch.kafka;
 
-
 import kafka.api.OffsetRequest;
 import org.apache.crunch.Pair;
 import org.apache.kafka.clients.consumer.Consumer;

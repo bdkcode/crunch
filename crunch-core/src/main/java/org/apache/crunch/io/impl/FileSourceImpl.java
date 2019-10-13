@@ -18,11 +18,14 @@
 package org.apache.crunch.io.impl;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
+import java.util.Map.Entry;
 import org.apache.commons.lang.builder.HashCodeBuilder;
 import org.apache.crunch.ReadableData;
 import org.apache.crunch.Source;
@@ -48,8 +51,8 @@ public class FileSourceImpl<T> implements ReadableSource<T> {
   private static final Logger LOG = LoggerFactory.getLogger(FileSourceImpl.class);
 
   @Deprecated
-  protected final Path path;
-  protected final List<Path> paths;
+  protected Path path;
+  protected List<Path> paths;
   protected final PType<T> ptype;
   protected final FormatBundle<? extends InputFormat> inputBundle;
 
@@ -86,8 +89,30 @@ public class FileSourceImpl<T> implements ReadableSource<T> {
   }
 
   @Override
+  public FileSystem getFileSystem() {
+    return inputBundle.getFileSystem();
+  }
+
+  @Override
   public Source<T> inputConf(String key, String value) {
     inputBundle.set(key, value);
+    return this;
+  }
+
+  @Override
+  public Source<T> fileSystem(FileSystem fileSystem) {
+    if (inputBundle.getFileSystem() != null) {
+      throw new IllegalStateException("Filesystem already set. Change is not supported.");
+    }
+
+    if (fileSystem != null) {
+      List<Path> qualifiedPaths = new ArrayList<>(paths.size());
+      for (Path path : paths) {
+        qualifiedPaths.add(fileSystem.makeQualified(path));
+      }
+      paths = qualifiedPaths;
+      inputBundle.setFileSystem(fileSystem);
+    }
     return this;
   }
 
@@ -112,12 +137,18 @@ public class FileSourceImpl<T> implements ReadableSource<T> {
     return ptype;
   }
 
+  private Configuration getEffectiveBundleConfig(Configuration configuration) {
+    // overlay the bundle config on top of a copy of the supplied config
+    return getBundle().configure(new Configuration(configuration));
+  }
+
   @Override
   public long getSize(Configuration configuration) {
     long size = 0;
+    Configuration bundleConfig = getEffectiveBundleConfig(configuration);
     for (Path path : paths) {
       try {
-        size += SourceTargetHelper.getPathSize(configuration, path);
+        size += SourceTargetHelper.getPathSize(bundleConfig, path);
       } catch (IOException e) {
         LOG.warn("Exception thrown looking up size of: {}", path, e);
         throw new IllegalStateException("Failed to get the file size of:" + path, e);
@@ -129,8 +160,9 @@ public class FileSourceImpl<T> implements ReadableSource<T> {
   protected Iterable<T> read(Configuration conf, FileReaderFactory<T> readerFactory)
       throws IOException {
     List<Iterable<T>> iterables = Lists.newArrayList();
+    Configuration bundleConfig = getEffectiveBundleConfig(conf);
     for (Path path : paths) {
-      FileSystem fs = path.getFileSystem(conf);
+      FileSystem fs = path.getFileSystem(bundleConfig);
       iterables.add(CompositePathIterable.create(fs, path, readerFactory));
     }
     return Iterables.concat(iterables);
@@ -147,9 +179,10 @@ public class FileSourceImpl<T> implements ReadableSource<T> {
   @Override
   public long getLastModifiedAt(Configuration conf) {
     long lastMod = -1;
+    Configuration bundleConfig = getEffectiveBundleConfig(conf);
     for (Path path : paths) {
       try {
-        FileSystem fs = path.getFileSystem(conf);
+        FileSystem fs = path.getFileSystem(bundleConfig);
         long lm = SourceTargetHelper.getLastModifiedAt(fs, path);
         if (lm > lastMod) {
           lastMod = lm;
